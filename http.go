@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"golang.org/x/net/websocket"
 	"log"
 	"net/http"
 	"os"
@@ -9,9 +11,10 @@ import (
 	"time"
 
 	"github.com/deepch/vdk/av"
-
-	webrtc "github.com/deepch/vdk/format/webrtcv3"
 	"github.com/gin-gonic/gin"
+
+	mse "github.com/deepch/vdk/format/mp4f"
+	webrtc "github.com/deepch/vdk/format/webrtcv3"
 )
 
 type JCodec struct {
@@ -23,7 +26,7 @@ func serveHTTP() {
 
 	router := gin.Default()
 	router.Use(CORSMiddleware())
-	
+
 	if _, err := os.Stat("./web"); !os.IsNotExist(err) {
 		router.LoadHTMLGlob("web/templates/*")
 		router.GET("/", HTTPAPIServerIndex)
@@ -31,7 +34,12 @@ func serveHTTP() {
 	}
 	router.POST("/stream/receiver/:uuid", HTTPAPIServerStreamWebRTC)
 	router.GET("/stream/codec/:uuid", HTTPAPIServerStreamCodec)
-	router.POST("/stream", HTTPAPIServerStreamWebRTC2)
+
+	router.GET("/ws", func(c *gin.Context) {
+		handler := websocket.Handler(ws)
+		s := websocket.Server{Handler: handler}
+		s.ServeHTTP(c.Writer, c.Request)
+	})
 
 	router.StaticFS("/static", http.Dir("web/static"))
 	err := router.Run(Config.Server.HTTPPort)
@@ -171,17 +179,22 @@ func CORSMiddleware() gin.HandlerFunc {
 	}
 }
 
+type Request struct {
+	Type string `json:"type"`
+	Sdp  string `json:"sdp,omitempty"`
+}
+
 type Response struct {
-	Tracks []string `json:"tracks"`
-	Sdp64  string   `json:"sdp64"`
+	Type   string `json:"type,omitempty"`
+	Codecs string `json:"codecs,omitempty"`
+	Error  string `json:"error,omitempty"`
+	Sdp    string `json:"sdp,omitempty"`
 }
 
-type ResponseError struct {
-	Error  string   `json:"error"`
-}
+func ws(ws *websocket.Conn) {
+	defer ws.Close()
 
-func HTTPAPIServerStreamWebRTC2(c *gin.Context) {
-	url := c.PostForm("url")
+	url := ws.Request().URL.Query().Get("url")
 	if _, ok := Config.Streams[url]; !ok {
 		Config.Streams[url] = StreamST{
 			URL:      url,
@@ -192,13 +205,121 @@ func HTTPAPIServerStreamWebRTC2(c *gin.Context) {
 
 	Config.RunIFNotRun(url)
 
-	codecs := Config.coGe(url)
-	if codecs == nil {
-		log.Println("Stream Codec Not Found")
-		c.JSON(500, ResponseError{Error: Config.LastError.Error()})
+	err := ws.SetWriteDeadline(time.Now().Add(15 * time.Second))
+	if err != nil {
+		log.Println("ws.SetWriteDeadline", err)
+		err = websocket.JSON.Send(ws, Response{Error: err.Error()})
+		if err != nil {
+			log.Println("websocket.JSON.Send", err)
+		}
 		return
 	}
 
+	codecs := Config.coGe(url)
+	if codecs == nil {
+		log.Println("Stream Codec Not Found")
+		err = websocket.JSON.Send(ws, Response{Error: Config.LastError.Error()})
+		if err != nil {
+			log.Println("websocket.JSON.Send", err)
+		}
+		return
+	}
+
+	for {
+		var request Request
+		err := websocket.JSON.Receive(ws, &request)
+		if err != nil {
+			log.Println("websocket.JSON.Receive", err)
+			return
+		}
+		switch request.Type {
+		case "mse":
+			go startMSE(ws, url)
+		case "webrtc":
+			go startWebRTC(ws, url, request.Sdp)
+		}
+	}
+}
+
+func startMSE(ws *websocket.Conn, url string) {
+	codecs := Config.coGe(url)
+
+	mseCodecs := make([]av.CodecData, 0)
+	mseIdx := make(map[int8]bool)
+	for i, codec := range codecs {
+		switch codec.Type() {
+		case av.H264, av.H265, av.AAC:
+			mseCodecs = append(mseCodecs, codec)
+			mseIdx[int8(i)] = true
+		}
+	}
+
+	mseMuxer := mse.NewMuxer(nil)
+	// only supported codecs
+	err := mseMuxer.WriteHeader(mseCodecs)
+	if err != nil {
+		log.Println("mseMuxer.WriteHeader", err)
+		err = websocket.JSON.Send(ws, Response{Error: err.Error()})
+		if err != nil {
+			log.Println("websocket.JSON.Send", err)
+		}
+		return
+	}
+
+	meta, init := mseMuxer.GetInit(mseCodecs)
+	err = websocket.JSON.Send(ws, Response{Type: "mse", Codecs: meta})
+	if err != nil {
+		log.Println("websocket.JSON.Send", err)
+		return
+	}
+
+	err = websocket.Message.Send(ws, init)
+	if err != nil {
+		log.Println("websocket.Message.Send", err)
+		return
+	}
+
+	cid, ch := Config.clAd(url)
+	defer Config.clDe(url, cid)
+
+	noVideo := time.NewTimer(10 * time.Second)
+	var start bool
+	for {
+		select {
+		case <-noVideo.C:
+			log.Println("noVideo")
+			err = websocket.JSON.Send(ws, Response{Error: "No video"})
+			if err != nil {
+				log.Println("websocket.JSON.Send", err)
+			}
+			return
+		case pck := <-ch:
+			if pck.IsKeyFrame {
+				noVideo.Reset(10 * time.Second)
+				start = true
+			}
+			if _, ok := mseIdx[pck.Idx]; !start || !ok {
+				continue
+			}
+
+			ready, buf, _ := mseMuxer.WritePacket(pck, false)
+			if ready {
+				err = ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+				if err != nil {
+					return
+				}
+
+				err = websocket.Message.Send(ws, buf)
+				if err != nil {
+					log.Println("websocket.Message.Send", err)
+					return
+				}
+			}
+		}
+	}
+}
+
+func startWebRTC(ws *websocket.Conn, url string, sdp string) {
 	muxerWebRTC := webrtc.NewMuxer(
 		webrtc.Options{
 			ICEServers: Config.GetICEServers(),
@@ -207,62 +328,50 @@ func HTTPAPIServerStreamWebRTC2(c *gin.Context) {
 		},
 	)
 
-	sdp64 := c.PostForm("sdp64")
-	answer, err := muxerWebRTC.WriteHeader(codecs, sdp64)
+	codecs := Config.coGe(url)
+
+	sdp64 := base64.StdEncoding.EncodeToString([]byte(sdp))
+	// check unsupported codecs inside
+	sdp64, err := muxerWebRTC.WriteHeader(codecs, sdp64)
 	if err != nil {
-		log.Println("Muxer WriteHeader", err)
-		c.JSON(500, ResponseError{Error: err.Error()})
+		log.Println("muxerWebRTC.WriteHeader", err)
+		return
+	}
+	sdpB, _ := base64.StdEncoding.DecodeString(sdp64)
+
+	err = websocket.JSON.Send(ws, Response{Type: "webrtc", Sdp: string(sdpB)})
+	if err != nil {
+		log.Println("websocket.JSON.Send", err)
 		return
 	}
 
-	response := Response{
-		Sdp64: answer,
-	}
+	// TODO: try to use single cid/ch
+	cid, ch := Config.clAd(url)
+	defer Config.clDe(url, cid)
 
-	for _, codec := range codecs {
-		if codec.Type() != av.H264 &&
-			codec.Type() != av.PCM_ALAW &&
-			codec.Type() != av.PCM_MULAW &&
-			codec.Type() != av.OPUS {
-			log.Println("Codec Not Supported WebRTC ignore this track", codec.Type())
-			continue
-		}
-		if codec.Type().IsVideo() {
-			response.Tracks = append(response.Tracks, "video")
-		} else {
-			response.Tracks = append(response.Tracks, "audio")
-		}
-	}
+	defer muxerWebRTC.Close()
 
-	c.JSON(200, response)
-
-	AudioOnly := len(codecs) == 1 && codecs[0].Type().IsAudio()
-
-	go func() {
-		cid, ch := Config.clAd(url)
-		defer Config.clDe(url, cid)
-		defer muxerWebRTC.Close()
-		var videoStart bool
-		noVideo := time.NewTimer(10 * time.Second)
-		for {
-			select {
-			case <-noVideo.C:
-				log.Println("noVideo")
+	var start bool
+	noVideo := time.NewTimer(10 * time.Second)
+	for {
+		select {
+		case <-noVideo.C:
+			log.Println("noVideo")
+			return
+		case pck := <-ch:
+			if pck.IsKeyFrame {
+				noVideo.Reset(10 * time.Second)
+				start = true
+			}
+			if !start {
+				continue
+			}
+			// check unsupported codecs inside
+			err = muxerWebRTC.WritePacket(pck)
+			if err != nil {
+				log.Println("muxerWebRTC.WritePacket", err)
 				return
-			case pck := <-ch:
-				if pck.IsKeyFrame || AudioOnly {
-					noVideo.Reset(10 * time.Second)
-					videoStart = true
-				}
-				if !videoStart && !AudioOnly {
-					continue
-				}
-				err = muxerWebRTC.WritePacket(pck)
-				if err != nil {
-					log.Println("WritePacket", err)
-					return
-				}
 			}
 		}
-	}()
+	}
 }
